@@ -73,6 +73,7 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
+#include <linux/stacktrace.h>
 
 #include <trace/events/kmem.h>
 
@@ -118,7 +119,6 @@ void print_register_content(struct pt_regs *regs) {
 	printk(KERN_CRIT "orig_rax: %lx\n", regs->orig_ax);
 }
 
-#include <linux/stacktrace.h>
 struct stacktrace_cookie {
 	unsigned long	*store;
 	unsigned int	size;
@@ -130,14 +130,14 @@ struct stack_frame_user {
 	unsigned long		ret_addr;
 };
 
-static bool stack_trace_consume_entry(void *cookie, unsigned long addr)
+static bool custom_stack_trace_consume(void *cookie, unsigned long addr)
 {
 	struct stacktrace_cookie *c = cookie;
 
 	if (c->len >= c->size)
 		return false;
 
-	if (c->skip > 0) {
+	if (c->skip) {
 		c->skip--;
 		return true;
 	}
@@ -166,11 +166,12 @@ copy_stack_frame(const struct stack_frame_user __user *fp,
 /**
  * Generate user stack trace
  */
-void tom_arch_stack_walk_user( 
-	void *cookie, const struct pt_regs *regs) {
+static void custom_arch_stack_walk_user(
+	bool (*consume)(void *, unsigned long),
+	void *cookie, const struct pt_regs *regs)
+{
 	const void __user *fp = (const void __user *)regs->bp;
-
-	if (!stack_trace_consume_entry(cookie, regs->ip))
+	if (!consume(cookie, regs->ip))
 		return;
 
 	while (1) {
@@ -184,40 +185,46 @@ void tom_arch_stack_walk_user(
 			break;
 		if (!frame.ret_addr)
 			break;
-		if (!stack_trace_consume_entry(cookie, frame.ret_addr))
+		if (!consume(cookie, frame.ret_addr))
 			break;
 		fp = frame.next_fp;
 	}
 }
 
-void tom_stack_trace_save_user(const struct pt_regs *regs, unsigned int size)
+unsigned int custom_stack_trace_save_user(struct pt_regs *regs,
+	unsigned long *store,
+	unsigned int size)
 {
-	void *stor_array = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	unsigned long *store = stor_array;
-	stack_trace_consume_fn consume_entry = stack_trace_consume_entry;
 	struct stacktrace_cookie c = {
-		.store	= store,
-		.size	= size,
+	.store = store,
+	.size  = size,
 	};
-	mm_segment_t fs;
 
-	/* Trace user stack if not a kernel thread */
+	mm_segment_t oldfs;
+
+	/* no user stack in a kernel thread! */
 	if (current->flags & PF_KTHREAD)
-		return ;
+	return 0;
 
-	fs = force_uaccess_begin();
-	tom_arch_stack_walk_user(&c, regs);
-	force_uaccess_end(fs);
+	oldfs = force_uaccess_begin();   /* let copy_from_user work safely */
 
-	// print until stor_array is empty
-	int i;
-	for (i = 0; i < c.len; i++) {
-		printk(KERN_CRIT "stack_trace_save_user: %lx\n", store[i]);
-	}
+	custom_arch_stack_walk_user(custom_stack_trace_consume, &c, regs);
 
-	kfree(stor_array);
+	force_uaccess_end(oldfs);
+	return c.len;
 }
 
+
+int read_user_instruction(unsigned long ip, unsigned char *instr, size_t len)
+{
+	int ret;
+	pagefault_disable();  /* or use copy_from_user_nofault() */
+	ret = copy_from_user(instr, (const void __user *)ip, len);
+	pagefault_enable();
+	if (ret)
+		return -EFAULT;
+	return 0;
+}
 
 /*
  * A number of key systems in x86 including ioremap() rely on the assumption
@@ -3803,11 +3810,32 @@ vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs, unsi
 	/* No need to invalidate - it was non-present before */
 	update_mmu_cache(vma, vmf->address, vmf->pte);
 
-	// printk(KERN_CRIT "\"%d PF addr and ip and real_address\", %lx, %lx, %lx\n", qemu_page_count, vmf->address, regs->ip, real_address);
+	printk(KERN_CRIT "\"%d PF addr and ip and real_address\", %lx, %lx, %lx\n", qemu_page_count, vmf->address, regs->ip, real_address);
 	// Let's print the page count, real address and the whole registers with stack trace
 	printk(KERN_CRIT "%d PF real address: %lx\n", qemu_page_count, real_address);
 	print_register_content(regs);
-	tom_stack_trace_save_user(regs, 8);
+	{
+		unsigned long tracebuf[16];
+		unsigned int i, n;
+	
+		n = custom_stack_trace_save_user(regs, tracebuf, ARRAY_SIZE(tracebuf));
+		for (i = 0; i < n; i++) {
+			unsigned long ip = tracebuf[i];
+			printk(KERN_CRIT "[#%d] IP=0x%lx\n", i, ip);
+	
+			/* Attempt to read 16 bytes of user instructions. */
+			unsigned char inst_buf[16];
+			if (!read_user_instruction(ip, inst_buf, sizeof(inst_buf))) {
+				int j;
+	
+				printk(KERN_CRIT " code bytes:");
+				/* Print all bytes in hex */
+				for (j = 0; j < 16; j++)
+					printk(KERN_CONT " %02x", inst_buf[j]);
+				printk(KERN_CONT "\n");
+			}
+		}
+	}
 	qemu_page_count++;
 
 #ifdef PRINT_PAGE_CONTENT
